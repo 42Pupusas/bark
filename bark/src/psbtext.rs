@@ -69,7 +69,7 @@ pub trait PsbtInputExt: BorrowMut<psbt::Input> {
 		let wit = Witness::from_slice(
 			&[&sig[..], exit_script.as_bytes(), &cb.serialize()],
 		);
-		debug_assert_eq!(wit.size(), claim.satisfaction_weight());
+		debug_assert_eq!(bitcoin::Weight::from_wu(wit.size() as u64), claim.satisfaction_weight());
 		self.borrow_mut().final_script_witness = Some(wit);
 
 	}

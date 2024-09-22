@@ -21,9 +21,9 @@ use self::chain::ChainSourceClient;
 const DB_MAGIC: &str = "onchain_bdk";
 
 pub struct Wallet {
-	wallet: bdk_wallet::wallet::Wallet,
+	wallet: bdk_wallet::Wallet,
 	//TODO(stevenroose) integrate into our own db
-	wallet_db: Store<bdk_wallet::wallet::ChangeSet>,
+	wallet_db: Store<bdk_wallet::ChangeSet>,
 	chain_source: ChainSourceClient,
 }
 
@@ -35,17 +35,30 @@ impl Wallet {
 		chain_source: ChainSource,
 	) -> anyhow::Result<Wallet> {
 		let db_path = dir.join("bdkwallet.db");
-		let mut db = Store::<bdk_wallet::wallet::ChangeSet>::open_or_create_new(DB_MAGIC.as_bytes(), db_path)?;
+		let mut db = Store::<bdk_wallet::ChangeSet>::open_or_create_new(DB_MAGIC.as_bytes(), db_path)?;
+		let init = db.aggregate_changesets()?;
 
 		//TODO(stevenroose) taproot?
 		let xpriv = bip32::Xpriv::new_master(network, &seed).expect("valid seed");
 		let edesc = format!("tr({}/84'/0'/0'/0/*)", xpriv);
 		let idesc = format!("tr({}/84'/0'/0'/1/*)", xpriv);
 
-		let init = db.aggregate_changesets()?;
-		let wallet = bdk_wallet::wallet::Wallet::new_or_load(&edesc, &idesc, init, network)
-			.context("failed to create or load bdk wallet")?;
-
+		let wallet = match init {
+			Some(changeset) => {
+				let wallet = bdk_wallet::Wallet::load()
+					.descriptor(bdk_wallet::KeychainKind::External, Some(edesc.clone()))
+					.descriptor(bdk_wallet::KeychainKind::Internal, Some(idesc.clone()))
+					.check_network(network)
+					.extract_keys()
+					.load_wallet_no_persist(changeset)?;
+				wallet.expect("wallet should be loaded")
+			},
+			None => {
+				bdk_wallet::Wallet::create(edesc, idesc)
+					.network(network)
+					.create_wallet_no_persist()?
+			},
+		};
 		let chain_source = ChainSourceClient::new(chain_source)?;
 		Ok(Wallet { wallet, wallet_db: db, chain_source })
 	}
@@ -86,7 +99,7 @@ impl Wallet {
 				}
 
 				let mempool = emitter.mempool()?;
-				self.wallet.apply_unconfirmed_txs(mempool.iter().map(|(tx, time)| (tx, *time)));
+				self.wallet.apply_unconfirmed_txs(mempool.iter().map(|(tx, time)| (tx.clone(), *time)));
 				if let Some(change) = self.wallet.take_staged() {
 					self.wallet_db.append_changeset(&change)?;
 				}
@@ -97,9 +110,8 @@ impl Wallet {
 
 				let request = self.wallet.start_full_scan();
 				let now = std::time::UNIX_EPOCH.elapsed().unwrap().as_secs();
-				let mut update = client.full_scan(request, STOP_GAP, PARALLEL_REQS).await?;
-				let _ = update.graph_update.update_last_seen_unconfirmed(now);
-				self.wallet.apply_update(update)?;
+				let update = client.full_scan(request, STOP_GAP, PARALLEL_REQS).await?;
+				self.wallet.apply_update_at(update, Some(now))?;
 				if let Some(changeset) = self.wallet.take_staged() {
 					self.wallet_db.append_changeset(&changeset)?;
 				}
@@ -128,7 +140,7 @@ impl Wallet {
 	pub fn prepare_tx(&mut self, dest: Address, amount: Amount) -> anyhow::Result<Psbt> {
 		let fee_rate = self.regular_fee_rate();
 		let mut b = self.wallet.build_tx();
-		b.ordering(bdk_wallet::wallet::tx_builder::TxOrdering::Untouched);
+		b.ordering(bdk_wallet::tx_builder::TxOrdering::Untouched);
 		b.add_recipient(dest.script_pubkey(), amount);
 		b.fee_rate(fee_rate);
 		b.enable_rbf();
@@ -140,7 +152,8 @@ impl Wallet {
 			trust_witness_utxo: true,
 			..Default::default()
 		};
-		let finalized = self.wallet.sign(&mut psbt, opts).context("failed to sign")?;
+		let finalized = self.wallet.sign(&mut psbt, opts).context("signing error")?;
+		warn!("finalized: {:?}", finalized);
 		assert!(finalized);
 		if let Some(change) = self.wallet.take_staged() {
 			self.wallet_db.append_changeset(&change)?;
@@ -161,7 +174,7 @@ impl Wallet {
 
 	fn add_anchors<A>(b: &mut bdk_wallet::TxBuilder<A>, anchors: &[OutPoint])
 	where
-		A: bdk_wallet::wallet::coin_selection::CoinSelectionAlgorithm,
+		A: bdk_wallet::coin_selection::CoinSelectionAlgorithm,
 	{
 		for utxo in anchors {
 			let psbt_in = psbt::Input {
@@ -177,7 +190,7 @@ impl Wallet {
 				}),
 				..Default::default()
 			};
-			b.add_foreign_utxo(*utxo, psbt_in, 33).expect("adding foreign utxo");
+			b.add_foreign_utxo(*utxo, psbt_in, Weight::from_wu(33)).expect("adding foreign utxo");
 		}
 	}
 

@@ -32,9 +32,9 @@ impl ClaimInput {
 		ciborium::from_reader(bytes)
 	}
 
-	pub fn satisfaction_weight(&self) -> usize {
+	pub fn satisfaction_weight(&self) -> bitcoin::Weight {
 		// NB might be vtxo-dependent in the future.
-		VTXO_CLAIM_INPUT_WEIGHT
+		bitcoin::Weight::from_wu(VTXO_CLAIM_INPUT_WEIGHT as u64)
 	}
 }
 
